@@ -1,0 +1,8 @@
+[program:log-watcher]
+command=/usr/bin/python3 /opt/log_watcher/bot.py
+directory=/opt/log_watcher
+autostart=true
+autorestart=true
+redirect_stderr=true
+stdout_logfile=/var/log/supervisor/log-watcher-out.log
+environment=TELEGRAM_BOT_TOKEN="REPLACE",TELEGRAM_CHAT_ID="1780820487",LOG_FILES="/root/cysic-prover/cysic-prover.log",KEYWORDS="re:start prepare task:\s*\d+",RAW_ONLY_PATTERNS="re:submit\s+taskData,\s*task:\s*\d+.*,re:task:\s*\d+\s+process\s+submitProofData\s+finish",BLACKOUT_SECONDS="300"
