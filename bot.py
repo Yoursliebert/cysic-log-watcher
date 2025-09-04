@@ -8,29 +8,50 @@ Fitur:
   lalu BLACKOUT selama BLACKOUT_SECONDS.
 - Trigger B (RAW_ONLY_PATTERNS): contoh 'submit taskData ...' / 'process submitProofData finish'
   → forward baris mentah TANPA judul dan TANPA blackout.
-- Multi file log (LOG_FILES pisah koma). Regex case-insensitive.
+- Token & Chat ID: bisa diambil dari env, atau jika kosong diminta input lalu disimpan ke /opt/log_watcher/.env
 
 Env:
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
-  LOG_FILES                   (wajib; pisah koma untuk banyak file)
-  KEYWORDS                    (default: re:start prepare task:\s*\d+)
-  RAW_ONLY_PATTERNS           (default: pola submit taskData + submitProofData finish)
-  BLACKOUT_SECONDS            (default: 300)
+  LOG_FILES
+  KEYWORDS
+  RAW_ONLY_PATTERNS
+  BLACKOUT_SECONDS
 """
 
 import os, re, sys, time, signal, atexit, logging, selectors, subprocess
 import urllib.parse, urllib.request
-from datetime import datetime
+from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stdout,
-)
+# === Load/save env file ===
+ENV_FILE = Path("/opt/log_watcher/.env")
 
-# ===== Config dari ENV =====
+def load_env_file():
+    if ENV_FILE.exists():
+        with open(ENV_FILE) as f:
+            for line in f:
+                if "=" in line and not line.strip().startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    os.environ.setdefault(k, v.strip('"'))
+
+def ensure_token_chat():
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print(">> Konfigurasi Telegram belum ada, masukkan sekarang.")
+        token = input("Masukkan TELEGRAM_BOT_TOKEN: ").strip()
+        chat_id = input("Masukkan TELEGRAM_CHAT_ID: ").strip()
+        with open(ENV_FILE, "w") as f:
+            f.write(f'TELEGRAM_BOT_TOKEN="{token}"\n')
+            f.write(f'TELEGRAM_CHAT_ID="{chat_id}"\n')
+        os.environ["TELEGRAM_BOT_TOKEN"] = token
+        os.environ["TELEGRAM_CHAT_ID"] = chat_id
+        print(f"[+] Token & Chat ID disimpan ke {ENV_FILE}")
+
+# === Inisialisasi ===
+load_env_file()
+ensure_token_chat()
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 LOG_FILES = [p.strip() for p in os.getenv("LOG_FILES", "").split(",") if p.strip()]
@@ -47,12 +68,13 @@ RAW_ONLY_PATTERNS = [p.strip() for p in os.getenv("RAW_ONLY_PATTERNS", DEFAULT_R
 BLACKOUT_SECONDS = int(os.getenv("BLACKOUT_SECONDS", "300"))
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    logging.error("Harus set TELEGRAM_BOT_TOKEN dan TELEGRAM_CHAT_ID")
+    print("Error: TELEGRAM_BOT_TOKEN dan TELEGRAM_CHAT_ID wajib di-set.")
     sys.exit(1)
 if not LOG_FILES:
-    logging.error("Harus set LOG_FILES")
+    print("Error: LOG_FILES wajib di-set.")
     sys.exit(1)
 
+# === Compile regex ===
 def compile_list(patterns):
     out = []
     for it in patterns:
@@ -65,7 +87,7 @@ def compile_list(patterns):
 PAT_KEYWORDS = compile_list(KEYWORDS)
 PAT_RAW_ONLY = compile_list(RAW_ONLY_PATTERNS)
 
-# ===== Telegram helper =====
+# === Telegram helper ===
 MDV2_ESC = re.compile(r"([_*\[\]()~`>#+\-=|{}.!])")
 def mdv2_escape(s: str) -> str:
     return MDV2_ESC.sub(r"\\\1", s)
@@ -78,7 +100,14 @@ def tg_send(text: str):
         if resp.status != 200:
             logging.warning("Telegram status %s", resp.status)
 
-# ===== Tail setup =====
+# === Tail setup ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+
 sel = selectors.DefaultSelector()
 procs = {}
 def start_tail(path: str):
@@ -101,10 +130,9 @@ atexit.register(stop_all)
 for path in LOG_FILES:
     start_tail(path)
 
-# ===== Startup notif =====
+# === Startup notif ===
 try:
     tg_send("*Log Watcher is online*\n*Files:* " + mdv2_escape(", ".join(LOG_FILES)))
-    # baris terakhir dari file pertama (kalau ada)
     try:
         first_log = LOG_FILES[0]
         with open(first_log, "r", encoding="utf-8", errors="ignore") as f:
@@ -118,7 +146,7 @@ try:
 except Exception as e:
     logging.error("Startup send failed: %s", e)
 
-# ===== Main loop =====
+# === Main loop ===
 RUNNING = True
 NEXT_READ_ALLOWED_TS = 0.0
 
@@ -148,21 +176,18 @@ while RUNNING and procs:
             continue
         line = line.rstrip("\n")
 
-        # 1) RAW_ONLY: forward apa adanya, TANPA blackout
-        p_raw, m_raw = any_match(line, PAT_RAW_ONLY)
+        # RAW_ONLY → forward mentah, tanpa blackout
+        p_raw, _ = any_match(line, PAT_RAW_ONLY)
         if p_raw:
-            try:
-                tg_send(mdv2_escape(line))
-            except Exception as e:
-                logging.error("Send RAW_ONLY failed: %s", e)
+            try: tg_send(mdv2_escape(line))
+            except Exception as e: logging.error("Send RAW_ONLY failed: %s", e)
             continue
 
-        # 2) Kalau sedang blackout, skip lainnya
         if in_blackout:
             continue
 
-        # 3) KEYWORDS: kirim 'Received Task' + blackout
-        p_kw, m_kw = any_match(line, PAT_KEYWORDS)
+        # KEYWORDS → "Received Task" + blackout
+        p_kw, _ = any_match(line, PAT_KEYWORDS)
         if not p_kw:
             continue
 
