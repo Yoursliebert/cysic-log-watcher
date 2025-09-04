@@ -11,3 +11,6 @@ chmod +x install.sh
 supervisorctl status log-watcher
 supervisorctl tail -f log-watcher
 ```
+```
+ supervisorctl restart log-watcher
+```
